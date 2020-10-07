@@ -9,6 +9,7 @@ alvan/vim-closetag
 alx741/vim-hindent
 alx741/vim-stylishask
 amiorin/ctrlp-z
+andreasvc/vim-256noir
 andrep/vimacs
 andreshazard/vim-logreview
 AndrewRadev/sideways.vim
@@ -68,6 +69,8 @@ darfink/starsearch.vim
 dart-lang/dart-vim-plugin
 david-a-wheeler/vim-metamath
 davidhalter/jedi-vim
+dbeniamine/cheat.sh-vim
+dbeniamine/vim-mail
 dcharbon/vim-flatbuffers
 dense-analysis/ale
 deoplete-plugins/deoplete-clang
@@ -381,6 +384,7 @@ osyo-manga/vim-over
 osyo-manga/vim-textobj-multiblock
 osyo-manga/vim-watchdogs
 overcache/NeoSolarized
+owickstrom/vim-colors-paramount
 pangloss/vim-javascript
 parsonsmatt/intero-neovim
 pearofducks/ansible-vim
@@ -414,6 +418,7 @@ raghur/vim-ghost
 Raimondi/delimitMate
 rakr/vim-one
 rbgrouleff/bclose.vim
+reasonml-editor/vim-reason-plus
 reedes/vim-pencil
 reedes/vim-wordy
 rhysd/committia.vim
@@ -567,6 +572,7 @@ vim-scripts/Colour-Sampler-Pack
 vim-scripts/DoxygenToolkit.vim
 vim-scripts/emodeline
 vim-scripts/gitignore.vim
+vim-scripts/icalendar.vim
 vim-scripts/Improved-AnsiEsc
 vim-scripts/jdaddy.vim
 vim-scripts/matchit.zip
