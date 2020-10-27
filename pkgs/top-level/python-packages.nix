@@ -5886,6 +5886,8 @@ in {
 
   pytorchWithoutCuda = self.pytorch.override { cudaSupport = false; };
 
+  pytradfri = callPackage ../development/python-modules/pytradfri { };
+
   pytrends = callPackage ../development/python-modules/pytrends { };
 
   pytricia = callPackage ../development/python-modules/pytricia { };
