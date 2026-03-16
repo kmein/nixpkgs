@@ -52,11 +52,9 @@ parser.add_argument("-v", "--verbose", action="count", default=0)
 def symlink_parents(p: Path) -> List[Path]:
     out = []
     while p.is_symlink() and p not in out:
-        parent = p.readlink()
-        if parent.is_relative_to("."):
-            p = p / parent
-        else:
-            p = parent
+        p = p.resolve()
+        if not p.is_dir():
+            continue
         out.append(p)
     return out
 
@@ -130,6 +128,8 @@ def entrypoint():
     )
     try:
         parsed_drv = json.loads(proc.stdout)
+        if "derivations" in parsed_drv:
+            parsed_drv = parsed_drv["derivations"]
     except json.JSONDecodeError:
         logging.error(
             "Couldn't parse the output of"
@@ -158,9 +158,9 @@ def entrypoint():
         if any(feature in required_features for feature in pattern["onFeatures"])
     )  # noqa: E501
 
-    queue: Deque[Tuple[PathString, PathString, bool]] = deque(
+    queue: Deque[Tuple[PathString, PathString, bool]] = deque(set(
         (mnt for pattern in patterns for mnt in validate_mounts(pattern))
-    )
+    ))
 
     unique_mounts: Set[Tuple[PathString, PathString]] = set()
     mounts: List[Tuple[PathString, PathString]] = []
@@ -174,16 +174,20 @@ def entrypoint():
         if not follow_symlinks:
             continue
 
+
         host_path = Path(host_path_str)
         if not (host_path.is_dir() or host_path.is_symlink()):
             continue
 
         # assert host_path_str == guest_path_str, (host_path_str, guest_path_str)
 
-        for child in host_path.iterdir() if host_path.is_dir() else [host_path]:
+        paths = [host_path] + list(child for child in host_path.iterdir() if host_path.is_dir())
+
+        for child in paths:
             for parent in symlink_parents(child):
                 parent_str = parent.absolute().as_posix()
-                queue.append((parent_str, parent_str, follow_symlinks))
+                if all(not parent.absolute().is_relative_to(existing_path) for existing_path, _ in unique_mounts):
+                    queue.append((parent_str, parent_str, follow_symlinks))
 
     # the pre-build-hook command
     if args.issue_command == "always" or (
