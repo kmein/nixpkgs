@@ -2,6 +2,7 @@ import base64
 import io
 import os
 import platform
+import pty
 import queue
 import re
 import select
@@ -148,7 +149,7 @@ class QemuStartCommand:
         self,
         monitor_socket_path: Path,
         qmp_socket_path: Path,
-        shell_socket_path: Path,
+        shell_pty_path: str,
         allow_reboot: bool = False,
         vsock_guest: Path | None = None,
     ) -> str:
@@ -184,7 +185,7 @@ class QemuStartCommand:
             f"{self._cmd}"
             f" -qmp unix:{qmp_socket_path},server=on,wait=off"
             f" -monitor unix:{monitor_socket_path}"
-            f" -chardev socket,id=shell,path={shell_socket_path}"
+            f" -chardev serial,id=shell,path={shell_pty_path}"
             f"{qemu_opts}"
             f"{display_opts}"
         )
@@ -211,7 +212,7 @@ class QemuStartCommand:
         shared_dir: Path,
         monitor_socket_path: Path,
         qmp_socket_path: Path,
-        shell_socket_path: Path,
+        shell_pty_path: str,
         allow_reboot: bool,
         vsock_guest: Path | None = None,
     ) -> subprocess.Popen:
@@ -219,7 +220,7 @@ class QemuStartCommand:
             self.cmd(
                 monitor_socket_path,
                 qmp_socket_path,
-                shell_socket_path,
+                shell_pty_path,
                 allow_reboot,
                 vsock_guest,
             ),
@@ -729,7 +730,6 @@ class QemuMachine(BaseMachine):
     state_dir: Path
     monitor_path: Path
     qmp_path: Path
-    shell_path: Path
 
     start_command: QemuStartCommand
 
@@ -738,6 +738,7 @@ class QemuMachine(BaseMachine):
     monitor: socket.socket | None
     qmp_client: QMPSession | None
     connection: Connection | None
+    _shell_slave_fd: int | None
     serial_thread: threading.Thread | None
 
     vsock_guest: Path | None
@@ -780,13 +781,13 @@ class QemuMachine(BaseMachine):
         # set up directories
         self.monitor_path = self.state_dir / "monitor"
         self.qmp_path = self.state_dir / "qmp"
-        self.shell_path = self.state_dir / "shell"
 
         self.process = None
         self.pid = None
         self.monitor = None
         self.qmp_client = None
         self.connection = None
+        self._shell_slave_fd = None
         self.serial_thread = None
 
         self.booted = False
@@ -1156,13 +1157,19 @@ class QemuMachine(BaseMachine):
             return s
 
         monitor_socket = create_socket(clear(self.monitor_path))
-        shell_socket = create_socket(clear(self.shell_path))
+        shell_master, shell_slave = pty.openpty()
+        # Keep the slave fd open in the parent so the pty pair survives a
+        # qemu close/reopen cycle (e.g. during reboot). Connection owns the
+        # master.
+        self._shell_slave_fd = shell_slave
+        self.connection = Connection(fd=shell_master, name=self.name, log=self.log)
+        shell_pty_path = os.ttyname(shell_slave)
         self.process = self.start_command.run(
             self.state_dir,
             self.shared_dir,
             self.monitor_path,
             self.qmp_path,
-            self.shell_path,
+            shell_pty_path,
             allow_reboot,
             self.vsock_guest,
         )
@@ -1188,10 +1195,6 @@ class QemuMachine(BaseMachine):
                     )
 
         self.monitor = accept_or_fail(monitor_socket, "monitor")
-        shell = accept_or_fail(shell_socket, "shell")
-        # Connection takes ownership of the fd; detach so the socket object
-        # does not double-close it during garbage collection.
-        self.connection = Connection(fd=shell.detach(), name=self.name, log=self.log)
         self.qmp_client = QMPSession.from_path(self.qmp_path)
 
         # Store last serial console lines for use
@@ -1332,6 +1335,12 @@ class QemuMachine(BaseMachine):
 
         self.process.terminate()
         self.connection.close()
+        if self._shell_slave_fd is not None:
+            try:
+                os.close(self._shell_slave_fd)
+            except OSError:
+                pass
+            self._shell_slave_fd = None
         self.monitor.close()
         self.serial_thread.join()
 
