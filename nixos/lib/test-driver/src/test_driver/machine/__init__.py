@@ -1377,6 +1377,10 @@ class NspawnMachine(BaseMachine):
     machine_sock_path: Path
     machine_sock: socket.socket | None
 
+    connection: Connection | None
+    _shell_slave_fd: int | None
+    connected: bool
+
     @staticmethod
     def machine_name_from_start_command(start_command: str) -> str:
         match = re.search("run-(.+)-nspawn", os.path.basename(start_command))
@@ -1409,6 +1413,10 @@ class NspawnMachine(BaseMachine):
 
         self.machine_sock_path = self.tmp_dir / f"{self.name}-nspawn.sock"
 
+        self.connection = None
+        self._shell_slave_fd = None
+        self.connected = False
+
     def ssh_backdoor_command(self) -> str:
         # documented in systemd-ssh-generator(8) and https://systemd.io/CONTAINER_INTERFACE/
         socket_path = f"/run/systemd/nspawn/unix-export/{self.name}/ssh"
@@ -1421,6 +1429,15 @@ class NspawnMachine(BaseMachine):
 
         if self.machine_sock:
             self.machine_sock.close()
+
+        if self.connection is not None:
+            self.connection.close()
+        if self._shell_slave_fd is not None:
+            try:
+                os.close(self._shell_slave_fd)
+            except OSError:
+                pass
+            self._shell_slave_fd = None
 
         self.logger.info(f"kill NspawnMachine (pid {self.process.pid})")
         self.process.terminate()
@@ -1498,6 +1515,15 @@ class NspawnMachine(BaseMachine):
 
         return container_pid
 
+    def connect(self) -> None:
+        if self.connected:
+            return
+        with self.nested("waiting for the container to finish booting"):
+            self.start()
+            assert self.connection
+            self.connection.wait_until_ready()
+            self.connected = True
+
     def _execute(
         self,
         command: str,
@@ -1505,41 +1531,14 @@ class NspawnMachine(BaseMachine):
         check_output: bool = True,
         timeout: int | None = 900,
     ) -> tuple[int, str]:
-        self.start()
-
-        container_pid = self.get_systemd_process
-        nsenter = shutil.which("nsenter")
-        assert nsenter is not None
-
-        # Sourcing /etc/profile on every call of `_execute` ensures a correct shell
-        # environment (correct PATH, etc.). This is slower than the QEMU version.
-        #
-        # NOTE If the test calls switch-to-configuration (with a differently configured specialization)
-        # this will use the /etc/profile of the new specialisation while `QemuMachine` nodes
-        # will continue to use the original /etc/profile.
-        command = f"set -eo pipefail; source /etc/profile; set -u; {command}"
-
-        cp = subprocess.run(
-            [
-                nsenter,
-                "--target",
-                str(container_pid),
-                "--mount",
-                "--uts",
-                "--ipc",
-                "--net",
-                "--pid",
-                "--cgroup",
-                "/bin/sh",
-                "-c",
-                command,
-            ],
-            env={},
+        self.connect()
+        assert self.connection
+        return self.connection.run(
+            command,
+            check_return=check_return,
+            check_output=check_output,
             timeout=timeout,
-            stdout=subprocess.PIPE,
-            text=True,
         )
-        return (cp.returncode, cp.stdout)
 
     def _stream_journal(self) -> None:
         assert self.process is not None, "Container not started"
@@ -1612,8 +1611,15 @@ class NspawnMachine(BaseMachine):
         self.machine_sock.bind(str(self.machine_sock_path))
         self.machine_sock.setblocking(False)
 
+        # allocate a pty pair; the slave is bind-mounted into the container as
+        # /dev/backdoor and opened by backdoor.service. Connection owns master.
+        master, slave = pty.openpty()
+        self._shell_slave_fd = slave
+        self.connection = Connection(fd=master, name=self.name, log=self.log)
+        shell_pty_path = os.ttyname(slave)
+
         self.process = subprocess.Popen(
-            [self.start_command],
+            [self.start_command, f"--bind={shell_pty_path}:/dev/backdoor"],
             env={
                 "RUN_NSPAWN_ROOT_DIR": str(self.state_dir),
                 "RUN_NSPAWN_SHARED_DIR": str(self.shared_dir),
