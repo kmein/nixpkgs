@@ -24,6 +24,7 @@ from typing import Any
 
 from test_driver.errors import MachineError, RequestedAssertionFailed
 from test_driver.logger import AbstractLogger
+from test_driver.machine.connection import Connection
 from test_driver.machine.ocr import (
     perform_ocr_on_screenshot,
     perform_ocr_variants_on_screenshot,
@@ -736,7 +737,7 @@ class QemuMachine(BaseMachine):
     pid: int | None
     monitor: socket.socket | None
     qmp_client: QMPSession | None
-    shell: socket.socket | None
+    connection: Connection | None
     serial_thread: threading.Thread | None
 
     vsock_guest: Path | None
@@ -785,7 +786,7 @@ class QemuMachine(BaseMachine):
         self.pid = None
         self.monitor = None
         self.qmp_client = None
-        self.shell = None
+        self.connection = None
         self.serial_thread = None
 
         self.booted = False
@@ -820,22 +821,6 @@ class QemuMachine(BaseMachine):
         assert self.monitor is not None
         self.monitor.send(message)
         return self.wait_for_monitor_prompt()
-
-    def _next_newline_closed_block_from_shell(self) -> str:
-        assert self.shell
-        output_buffer = []
-        while True:
-            # This receives up to 4096 bytes from the socket
-            chunk = self.shell.recv(4096)
-            if not chunk:
-                # Probably a broken pipe, return the output we have
-                break
-
-            decoded = chunk.decode()
-            output_buffer += [decoded]
-            if decoded[-1] == "\n":
-                break
-        return "".join(output_buffer)
 
     def get_tty_text(self, tty: str) -> str:
         """
@@ -876,37 +861,13 @@ class QemuMachine(BaseMachine):
         timeout: int | None = 900,
     ) -> tuple[int, str]:
         self.connect()
-
-        # Always run command with shell opts
-        command = f"set -euo pipefail; {command}"
-
-        timeout_str = ""
-        if timeout is not None:
-            timeout_str = f"timeout {timeout}"
-
-        # While sh is bash on NixOS, this is not the case for every distro.
-        # We explicitly call bash here to allow for the driver to boot other distros as well.
-        out_command = (
-            f"{timeout_str} bash -c {shlex.quote(command)} | (base64 -w 0; echo)\n"
+        assert self.connection
+        return self.connection.run(
+            command,
+            check_return=check_return,
+            check_output=check_output,
+            timeout=timeout,
         )
-
-        assert self.shell
-        self.shell.send(out_command.encode())
-
-        if not check_output:
-            return (-2, "")
-
-        # Get the output
-        output = base64.b64decode(self._next_newline_closed_block_from_shell())
-
-        if not check_return:
-            return (-1, output.decode())
-
-        # Get the return code
-        self.shell.send(b"echo ${PIPESTATUS[0]}\n")
-        rc = int(self._next_newline_closed_block_from_shell().strip())
-
-        return (rc, output.decode(errors="replace"))
 
     def shell_interact(self, address: str | None = None) -> None:
         """
@@ -916,20 +877,8 @@ class QemuMachine(BaseMachine):
         the guest session.
         """
         self.connect()
-
-        if address is None:
-            address = "READLINE,prompt=$ "
-            self.log("Terminal is ready (there is no initial prompt):")
-
-        assert self.shell
-        try:
-            subprocess.run(
-                ["socat", address, f"FD:{self.shell.fileno()}"],
-                pass_fds=[self.shell.fileno()],
-            )
-            # allow users to cancel this command without breaking the test
-        except KeyboardInterrupt:
-            pass
+        assert self.connection
+        self.connection.interact(address)
 
     def console_interact(self) -> None:
         """
@@ -1024,46 +973,13 @@ class QemuMachine(BaseMachine):
         """
         Wait for a connection to the guest root shell
         """
-
-        def shell_ready(timeout_secs: int) -> bool:
-            """We sent some data from the backdoor service running on the guest
-            to indicate that the backdoor shell is ready.
-            As soon as we read some data from the socket here, we assume that
-            our root shell is operational.
-            """
-            assert self.shell
-            (ready, _, _) = select.select([self.shell], [], [], timeout_secs)
-            return bool(ready)
-
         if self.connected:
             return
 
         with self.nested("waiting for the VM to finish booting"):
             self.start()
-
-            assert self.shell
-
-            tic = time.time()
-            # TODO: do we want to bail after a set number of attempts?
-            while not shell_ready(timeout_secs=30):
-                self.log("Guest root shell did not produce any data yet...")
-                self.log(
-                    "  To debug, enter the VM and run 'systemctl status backdoor.service'."
-                )
-
-            while True:
-                chunk = self.shell.recv(1024)
-                if len(chunk) == 0:
-                    raise RuntimeError("Shell disconnected")
-                self.log(f"Guest shell says: {chunk!r}")
-                # NOTE: for this to work, nothing must be printed after this line!
-                if b"Spawning backdoor root shell..." in chunk:
-                    break
-
-            toc = time.time()
-
-            self.log("connected to guest root shell")
-            self.log(f"(connecting took {toc - tic:.2f} seconds)")
+            assert self.connection
+            self.connection.wait_until_ready()
             self.connected = True
 
     @contextmanager
@@ -1272,7 +1188,10 @@ class QemuMachine(BaseMachine):
                     )
 
         self.monitor = accept_or_fail(monitor_socket, "monitor")
-        self.shell = accept_or_fail(shell_socket, "shell")
+        shell = accept_or_fail(shell_socket, "shell")
+        # Connection takes ownership of the fd; detach so the socket object
+        # does not double-close it during garbage collection.
+        self.connection = Connection(fd=shell.detach(), name=self.name, log=self.log)
         self.qmp_client = QMPSession.from_path(self.qmp_path)
 
         # Store last serial console lines for use
@@ -1309,8 +1228,8 @@ class QemuMachine(BaseMachine):
         if not self.booted:
             return
 
-        assert self.shell
-        self.shell.send(b"poweroff\n")
+        assert self.connection
+        self.connection.send(b"poweroff\n")
         self.wait_for_shutdown()
 
     def crash(self) -> None:
@@ -1332,6 +1251,8 @@ class QemuMachine(BaseMachine):
         """
         self.send_key("ctrl-alt-delete")
         self.connected = False
+        if self.connection is not None:
+            self.connection.reset_ready()
 
     def wait_for_x(self, timeout: int = 900) -> None:
         """
@@ -1405,12 +1326,12 @@ class QemuMachine(BaseMachine):
             return
         self.logger.info(f"kill QemuMachine (pid {self.pid})")
         assert self.process
-        assert self.shell
+        assert self.connection
         assert self.monitor
         assert self.serial_thread
 
         self.process.terminate()
-        self.shell.close()
+        self.connection.close()
         self.monitor.close()
         self.serial_thread.join()
 
