@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import tty
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator
@@ -98,6 +99,18 @@ CHAR_TO_KEY = {
 
 def make_command(args: list) -> str:
     return " ".join(map(shlex.quote, (map(str, args))))
+
+
+def _open_backdoor_pty() -> tuple[int, int, str]:
+    """Allocate a pty pair in raw mode. The slave is intended to be opened by
+    a guest (qemu via -chardev serial,path=... or nspawn via --bind) and read
+    by the backdoor.service running there; the host's `stty raw -echo` inside
+    the guest may silently fail (e.g. in initrd where stty isn't on PATH), so
+    we set termios on the host side to avoid depending on it.
+    """
+    master, slave = pty.openpty()
+    tty.setraw(master)
+    return master, slave, os.ttyname(slave)
 
 
 def retry(fn: Callable, timeout_seconds: int = 900) -> None:
@@ -980,6 +993,8 @@ class QemuMachine(BaseMachine):
         with self.nested("waiting for the VM to finish booting"):
             self.start()
             assert self.connection
+            # After reboot / switch_root the backdoor re-announces itself.
+            self.connection.reset_ready()
             self.connection.wait_until_ready()
             self.connected = True
 
@@ -1157,13 +1172,12 @@ class QemuMachine(BaseMachine):
             return s
 
         monitor_socket = create_socket(clear(self.monitor_path))
-        shell_master, shell_slave = pty.openpty()
         # Keep the slave fd open in the parent so the pty pair survives a
         # qemu close/reopen cycle (e.g. during reboot). Connection owns the
         # master.
+        shell_master, shell_slave, shell_pty_path = _open_backdoor_pty()
         self._shell_slave_fd = shell_slave
         self.connection = Connection(fd=shell_master, name=self.name, log=self.log)
-        shell_pty_path = os.ttyname(shell_slave)
         self.process = self.start_command.run(
             self.state_dir,
             self.shared_dir,
@@ -1254,8 +1268,6 @@ class QemuMachine(BaseMachine):
         """
         self.send_key("ctrl-alt-delete")
         self.connected = False
-        if self.connection is not None:
-            self.connection.reset_ready()
 
     def wait_for_x(self, timeout: int = 900) -> None:
         """
@@ -1521,6 +1533,7 @@ class NspawnMachine(BaseMachine):
         with self.nested("waiting for the container to finish booting"):
             self.start()
             assert self.connection
+            self.connection.reset_ready()
             self.connection.wait_until_ready()
             self.connected = True
 
@@ -1613,10 +1626,9 @@ class NspawnMachine(BaseMachine):
 
         # allocate a pty pair; the slave is bind-mounted into the container as
         # /dev/backdoor and opened by backdoor.service. Connection owns master.
-        master, slave = pty.openpty()
+        master, slave, shell_pty_path = _open_backdoor_pty()
         self._shell_slave_fd = slave
         self.connection = Connection(fd=master, name=self.name, log=self.log)
-        shell_pty_path = os.ttyname(slave)
 
         self.process = subprocess.Popen(
             [self.start_command, f"--bind={shell_pty_path}:/dev/backdoor"],
