@@ -26,7 +26,7 @@ in
       ];
 
       # Backdoor uses bash
-      testing.backdoor = false;
+      testing.backdoor.enable = false;
 
       virtualisation = {
         directBoot.enable = false;

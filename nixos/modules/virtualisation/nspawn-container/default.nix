@@ -68,6 +68,11 @@ in
   config = {
     boot.isNspawnContainer = true;
 
+    # backdoor reads from a host-allocated pty bind-mounted into the container
+    # by the test driver; no serial console exists to send stderr to.
+    testing.backdoor.device = lib.mkDefault "/dev/backdoor";
+    testing.backdoor.errorOutput = lib.mkDefault null;
+
     assertions = [
       {
         assertion = config.specialisation == { };

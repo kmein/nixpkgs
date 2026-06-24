@@ -16,15 +16,20 @@ let
 
   qemu-common = import ../../lib/qemu-common.nix { inherit (pkgs) lib stdenv; };
 
+  device = cfg.backdoor.device;
+  errorOutput = cfg.backdoor.errorOutput;
+
+  # Only depend on a systemd device unit for devices that actually have one
+  # (virtio console, serial). Bind-mounted pty slaves in nspawn don't get
+  # one and waiting on them would block startup forever.
+  deviceUnitDeps = lib.optionals (errorOutput != null) [
+    "dev-hvc0.device"
+    "dev-${qemu-common.qemuSerialDevice}.device"
+  ];
+
   backdoorService = {
-    requires = [
-      "dev-hvc0.device"
-      "dev-${qemu-common.qemuSerialDevice}.device"
-    ];
-    after = [
-      "dev-hvc0.device"
-      "dev-${qemu-common.qemuSerialDevice}.device"
-    ];
+    requires = deviceUnitDeps;
+    after = deviceUnitDeps;
     script = ''
       export USER=root
       export HOME=/root
@@ -52,10 +57,12 @@ let
       export PAGER=
 
       cd /tmp
-      exec < /dev/hvc0 > /dev/hvc0
-      while ! exec 2> /dev/${qemu-common.qemuSerialDevice}; do sleep 0.1; done
+      exec < ${device} > ${device}
+      ${lib.optionalString (errorOutput != null) ''
+        while ! exec 2> ${errorOutput}; do sleep 0.1; done
+      ''}
       echo "connecting to host..." >&2
-      stty -F /dev/hvc0 raw -echo # prevent nl -> cr/nl conversion
+      stty -F ${device} raw -echo # prevent nl -> cr/nl conversion
       # The following line is essential since it signals to
       # the test driver that the shell is ready.
       # See: the connect method in the Machine class.
@@ -67,7 +74,7 @@ let
       # we can also run non-NixOS guests during tests. This, however, is
       # mostly futureproofing as the test instrumentation is still very
       # tightly coupled to NixOS.
-      PS1="" exec ${pkgs.bashNonInteractive}/bin/bash --norc /dev/hvc0
+      PS1="" exec ${pkgs.bashNonInteractive}/bin/bash --norc ${device}
     '';
     serviceConfig.KillSignal = "SIGHUP";
   };
@@ -85,9 +92,30 @@ in
 {
 
   options.testing = {
-    backdoor = lib.mkEnableOption "backdoor service in stage 2" // {
-      # See assertion below for why the backdoor doesn't work with containers.
-      default = !config.boot.isContainer;
+    backdoor = {
+      enable = lib.mkEnableOption "backdoor service in stage 2" // {
+        default = true;
+      };
+
+      device = lib.mkOption {
+        type = lib.types.str;
+        default = "/dev/hvc0";
+        description = ''
+          Path of the character device the backdoor shell opens for both its
+          stdin and stdout. Defaults to the QEMU virtio console; nspawn sets
+          this to a bind-mounted host pty slave.
+        '';
+      };
+
+      errorOutput = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = "/dev/${qemu-common.qemuSerialDevice}";
+        description = ''
+          Device the backdoor service writes its stderr to. Set to `null` to
+          leave stderr on the journal (used for nspawn, where there is no
+          serial console).
+        '';
+      };
     };
 
     initrdBackdoor = lib.mkEnableOption ''
@@ -110,13 +138,6 @@ in
         '';
       }
       {
-        assertion = config.boot.isContainer -> !cfg.backdoor;
-        message = ''
-          `testing.backdoor` uses virtio console, which does not work with
-          containers (we use `nsenter` instead).
-        '';
-      }
-      {
         assertion = config.boot.isContainer -> !cfg.initrdBackdoor;
         message = ''
           `testing.initrdBackdoor` does not work with containers as there is no initrd.
@@ -124,7 +145,7 @@ in
       }
     ];
 
-    systemd.services.backdoor = lib.mkIf cfg.backdoor (
+    systemd.services.backdoor = lib.mkIf cfg.backdoor.enable (
       lib.mkMerge [
         backdoorService
         {
